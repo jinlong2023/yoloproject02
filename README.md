@@ -1,7 +1,133 @@
+## 基于 YOLOv13 + 卡尔曼滤波 + PID控制 的动态目标追踪算法
+
+---
+
+## 系统架构
+
+```
+视频输入 → 光照自适应预处理 → YOLOv13目标检测 → CNN特征提取
+         → 卡尔曼滤波多目标跟踪 → 主目标选择 → 运动预测
+         → PID云台控制计算 → 云台角度执行 → 闭环反馈
+```
+
+## 核心模块
+
+| 模块 | 文件 | 功能 |
+|------|------|------|
+| 配置中心 | `config.py` | 全局参数配置（检测、跟踪、PID、相机） |
+| 目标检测 | `modules/detector.py` | YOLOv13多尺度检测 + 光照自适应 + CNN特征提取 |
+| 目标跟踪 | `modules/tracker.py` | 卡尔曼滤波 + CNN外观匹配 + 光流估计 + 遮挡处理 |
+| 云台控制 | `modules/gimbal_controller.py` | 双轴PID控制 + 运动预测前馈 + 输出平滑 + 云台仿真 |
+| 可视化 | `modules/visualizer.py` | 实时画面叠加 + 轨迹绘制 + 数据记录 + 报告生成 |
+| 主流程 | `main.py` | 系统集成 + 仿真测试 + 基准测试 |
+
+## 安装与运行
+
+### 1. 环境准备
+
+```bash
+# 创建虚拟环境 (推荐)
+conda create -n 项目名称 python=3.11
+conda activate 项目名称
+# 安装PyTorch (根据CUDA版本选择)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+
+# 安装依赖
+pip install -r requirements.txt
+```
+
+### 2. 运行方式
+
+```bash
+# 摄像头实时模式
+python main.py
+
+# 视频文件模式
+python main.py --source video.mp4
+
+# 仿真测试模式 (无需摄像头)
+python main.py --simulate
+
+# 性能基准测试
+python main.py --benchmark
+
+# 自定义参数
+python main.py --source 0 --model yolov8n.pt --device cuda:0 --conf 0.45 \
+               --kp-yaw 0.8 --ki-yaw 0.05 --kd-yaw 0.15
+```
+
+### 3. PyCharm配置
+
+1. 打开项目根目录 
+2. 设置Python解释器为已安装依赖的环境
+3. 右键 `main.py` → Run
+4. 或配置 Run Configuration，在 Parameters 中添加参数如 `--simulate`
+
+## 快捷键
+
+| 按键 | 功能 |
+|------|------|
+| `q` / `ESC` | 退出 |
+| `空格` | 暂停/继续 |
+| `r` | 重置跟踪器 |
+| `s` | 保存截图 |
+| `t` | 切换轨迹显示 |
+| `i` | 切换信息面板 |
+| `鼠标左键` | 选择主跟踪目标 |
+
+## 算法原理
+
+### 1. 目标检测 (YOLOv13)
+- 基于 ultralytics 框架的YOLO系列模型
+- 多尺度特征金字塔检测
+- CLAHE光照自适应预处理
+- CNN外观特征提取（128维向量）用于跟踪关联
+
+### 2. 多目标跟踪 (卡尔曼滤波 + CNN)
+- **状态向量**: `[x, y, w, h, vx, vy, vw, vh]` (位置+速度)
+- **匀速运动模型**预测 + 观测更新
+- **数据关联**: 匈牙利算法，融合 IOU距离 + 余弦外观距离
+- **光流辅助**: Lucas-Kanade稀疏光流，前后向一致性验证
+- **遮挡处理**: 纯预测模式（最大15帧），特征队列保持重识别能力
+
+### 3. PID云台控制
+- **双轴独立PID**: Yaw(偏航) + Pitch(俯仰) 分别控制
+- **增量式PID**: 积分限幅 + 微分低通滤波 + 死区控制
+- **运动预测前馈**: 二次运动模型（位置+速度+加速度）预测补偿
+- **输出平滑**: 指数移动平均，避免云台抖动
+- **闭环反馈**: 目标偏离画面中心 → 误差 → PID → 云台转动 → 目标回归中心
+
+## 输出文件
+
+运行后在 `results/` 目录生成：
+
+| 文件 | 内容 |
+|------|------|
+| `tracking_data.json` | 逐帧跟踪数据（位置、速度、误差、控制量） |
+| `performance_report.json` | 性能分析报告 |
+| `analysis_plots.png` | 分析图表（误差曲线、云台响应、PID输出、目标速度） |
+| `output.mp4` | 录制的结果视频（需 `--record` 参数） |
+
+## 项目结构
+
+```
+gimbal_tracking_system/
+├── main.py                      # 主程序入口
+├── config.py                    # 全局配置
+├── requirements.txt             # 依赖清单
+├── README.md                    # 说明文档
+├── modules/
+│   ├── __init__.py
+│   ├── detector.py              # 目标检测模块
+│   ├── tracker.py               # 目标跟踪模块
+│   ├── gimbal_controller.py     # 云台控制模块
+│   └── visualizer.py            # 可视化与分析模块
+├── results/                     # 输出结果
+├── logs/                        # 运行日志
+└── data/                        # 测试数据
+```
+
 # Z-2Mini 集成修改说明
-
-## 文件变更一览
-
 ```
 项目/
 ├── config.py                     [修改] 新增 Z-2Mini 硬件配置字段
@@ -14,44 +140,9 @@
     └── visualizer.py             [未修改]
 ```
 
-## 具体修改内容
 
-### 1. `config.py` — 新增字段
 
-`GimbalConfig` 新增了 4 个字段:
-
-```python
-simulate_mode: bool = True           # ← 改为 False 启用硬件
-gcu_ip: str = "192.168.144.108"
-comm_mode: str = "udp"               # "udp" 或 "tcp"
-track_mode: str = "gimbal_builtin"   # "gimbal_builtin" 或 "software_pid"
-```
-
-新增 `get_z2mini_config()` 函数，一键获取硬件配置。
-
-### 2. `gimbal_controller.py` — 核心修改
-
-**保留了全部原有代码**（PIDController、MotionPredictor、GimbalSimulator、GimbalController），新增:
-
-- `GimbalHardwareZ2Mini` 类: 实现与 `GimbalSimulator` **相同接口**
-  - `apply_command(yaw_cmd, pitch_cmd, dt)` → 通过 0x11 指向锁定模式发送角速度
-  - `get_state()` → 从 GCU 回传数据获取真实姿态
-  - `reset()` → 发送回中指令
-  - `start_tracking() / stop_tracking()` → 0x17 吊舱内置跟踪
-- `pixel_to_gcu_coord()`: 像素坐标到 GCU [0,10000] 坐标转换
-- `GimbalController` 修改:
-  - 构造函数: `simulate_mode=False` 时自动创建 `GimbalHardwareZ2Mini`
-  - `compute_control()`: 新增 `target_bbox` 参数，`gimbal_builtin` 模式分支
-
-### 3. `main.py` — 主流程修改
-
-- 新增 `RTSPCapture` 类: 线程化 RTSP 取流，消除缓冲延迟
-- `_open_video()`: 支持 `rtsp://` 前缀自动使用 RTSPCapture
-- `process_frame()`: 将主目标 bbox 传给 `compute_control(target_bbox=...)`
-- 新增快捷键: `p`=拍照, `v`=录像, `h`=回中
-- CLI: `--z2mini`, `--gcu-ip`, `--comm-mode`, `--track-mode`
-
-### 4. `gcu_protocol.py` — 全新文件
+### 1. `gcu_protocol.py` 
 
 完整实现 GCU 私有协议 V2.0.6:
 - CRC16 校验、数据包构建/解析
@@ -62,7 +153,7 @@ track_mode: str = "gimbal_builtin"   # "gimbal_builtin" 或 "software_pid"
 
 ## 使用方法
 
-### 仿真模式 (与你原来完全一样)
+### 仿真模式 
 
 ```bash
 python main.py --source 0
