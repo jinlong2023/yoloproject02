@@ -1,402 +1,311 @@
 """
-========================================================================
-Z-2Mini GCU 私有通信协议 Python 实现
-========================================================================
-协议版本: V0.2 (文档版本 V2.0.6)
-支持 UDP / TCP 通信方式
-
-基于《GCU私有通信协议-XF_A5_V2_0_6》实现
-此模块作为底层通信层，由 gimbal_controller.py 中的 GimbalHardwareZ2Mini 调用。
+GCU 通信协议模块 (基于 GCU 私有协议 V2.0.6)
+已适配 SystemConfig / GimbalConfig
 """
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import struct
 import socket
+import struct
 import threading
 import time
-from typing import Optional, Tuple
 from dataclasses import dataclass
+from typing import Optional
+from config import GimbalConfig
 
-# ============================================================
-# 常量
-# ============================================================
-HEADER_SEND = bytes([0xA8, 0xE5])
-HEADER_RECV = bytes([0x8A, 0x5E])
-PROTOCOL_VERSION = 0x02
+# ── 协议常量 ──────────────────────────────────────────────────
+PROTOCOL_HEADER_SEND = bytes([0xA8, 0xE5])
+PROTOCOL_HEADER_RECV = bytes([0x8A, 0x5E])
+PROTOCOL_VERSION     = 0x01
+GCU_SEND_PORT        = 2337   # 发送到设备的端口
+GCU_RECV_PORT        = 2338   # 本地绑定接收端口
 
-DEFAULT_GCU_IP = "192.168.144.108"
-UDP_SRC_PORT = 2337   # GCU 监听端口 (上位机发往此端口)
-UDP_DST_PORT = 2338   # 上位机监听端口 (GCU 回传到此端口)
-TCP_PORT = 2332
+# ── 状态数据类 ─────────────────────────────────────────────────
+@dataclass
+class GimbalStatus:
+    mode:           int
+    pitch:          float
+    yaw:            float
+    roll:           float
+    cam1_zoom:      float
+    cam2_zoom:      float
+    is_tracking_ok: bool
+    target_x:       int
+    target_y:       int
 
-
-# ============================================================
-# CRC16 (CCITT-FALSE, 与文档 C 代码一致)
-# ============================================================
-_CRC_TABLE = [
-    0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50A5, 0x60C6, 0x70E7,
-    0x8108, 0x9129, 0xA14A, 0xB16B, 0xC18C, 0xD1AD, 0xE1CE, 0xF1EF,
-]
-
+# ── CRC16 ─────────────────────────────────────────────────────
 def _crc16(data: bytes) -> int:
+    crc_ta = [
+        0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50a5, 0x60c6, 0x70e7,
+        0x8108, 0x9129, 0xa14a, 0xb16b, 0xc18c, 0xd1ad, 0xe1ce, 0xf1ef
+    ]
     crc = 0
     for byte in data:
-        da = (crc >> 12) & 0x0F
-        crc = ((crc << 4) & 0xFFFF) ^ _CRC_TABLE[da ^ (byte >> 4)]
-        da = (crc >> 12) & 0x0F
-        crc = ((crc << 4) & 0xFFFF) ^ _CRC_TABLE[da ^ (byte & 0x0F)]
+        da  = (crc >> 12) & 0x0F
+        crc = (crc << 4) & 0xFFFF
+        crc ^= crc_ta[da ^ ((byte >> 4) & 0x0F)]
+        da  = (crc >> 12) & 0x0F
+        crc = (crc << 4) & 0xFFFF
+        crc ^= crc_ta[da ^ (byte & 0x0F)]
     return crc
 
-
-# ============================================================
-# 指令码
-# ============================================================
-CMD_EMPTY           = 0x00
-CMD_CALIBRATE       = 0x01
-CMD_HOME            = 0x03
-CMD_ANGLE_CTRL      = 0x10
-CMD_POINTING_LOCK   = 0x11
-CMD_POINTING_FOLLOW = 0x12
-CMD_NADIR           = 0x13
-CMD_EULER_CTRL      = 0x14
-CMD_STARE_COORD     = 0x15
-CMD_STARE_TARGET    = 0x16
-CMD_TRACK           = 0x17
-CMD_POINT_MOVE      = 0x1A
-CMD_FPV             = 0x1C
-CMD_PHOTO           = 0x20
-CMD_RECORD          = 0x21
-CMD_ZOOM_IN         = 0x22
-CMD_ZOOM_OUT        = 0x23
-CMD_ZOOM_STOP       = 0x24
-CMD_ZOOM_SET        = 0x25
-CMD_TARGET_DETECT   = 0x75
-CMD_PIP             = 0x74
-
-
-# ============================================================
-# GCU 返回状态解析结果
-# ============================================================
-@dataclass
-class GCUStatus:
-    """GCU 回传数据解析结果"""
-    # 主帧
-    mode: int = 0                   # 工作模式
-    status_flags: int = 0           # 状态标志
-    miss_h: int = 0                 # 水平脱靶量 [-1000, 1000]
-    miss_v: int = 0                 # 垂直脱靶量 [-1000, 1000]
-    rel_roll: float = 0.0           # 相机相对滚转 (deg, 编码器)
-    rel_pitch: float = 0.0          # 相机相对俯仰 (deg, 编码器)
-    rel_yaw: float = 0.0            # 相机相对偏航 (deg, 编码器)
-    abs_roll: float = 0.0           # 绝对滚转 (deg)
-    abs_pitch: float = 0.0          # 绝对俯仰 (deg)
-    abs_yaw: float = 0.0            # 绝对偏航 (deg)
-    gyro_x: float = 0.0             # 角速度 X (deg/s)
-    gyro_y: float = 0.0             # 角速度 Y (deg/s)
-    gyro_z: float = 0.0             # 角速度 Z (deg/s)
-
-    # 副帧
-    target_dist: float = 0.0        # 目标距离 (m)
-    target_lon: float = 0.0
-    target_lat: float = 0.0
-    target_alt: float = 0.0
-    cam1_zoom: float = 1.0
-    cam2_zoom: float = 1.0
-    cam_status: int = 0
-    ir_status: int = 0
-
-    # 命令反馈
-    cmd_fb: int = 0
-    cmd_result: int = -1            # 0=成功, 1=失败, 2=执行中
-
-    @property
-    def is_tracking_ok(self) -> bool:
-        """吊舱跟踪是否成功 (B0)"""
-        return (self.status_flags & 0x01) == 1
-
-    @property
-    def is_inverted(self) -> bool:
-        """倒装模式 (B12)"""
-        return (self.status_flags >> 12 & 0x01) == 1
-
-    @property
-    def is_recording(self) -> bool:
-        return (self.cam_status >> 4 & 0x01) == 1
-
-    @property
-    def mode_name(self) -> str:
-        names = {
-            0x10: "ANGLE_CTRL", 0x11: "POINT_LOCK", 0x12: "POINT_FOLLOW",
-            0x13: "NADIR", 0x14: "EULER_CTRL", 0x16: "STARE",
-            0x17: "TRACKING", 0x1C: "FPV",
-        }
-        return names.get(self.mode, f"0x{self.mode:02X}")
-
-
-# ============================================================
-# 数据包构建
-# ============================================================
-def _build_main_frame(
-    roll_ctrl: int = 0, pitch_ctrl: int = 0, yaw_ctrl: int = 0,
-    ctrl_valid: bool = False, imu_valid: bool = False,
-    v_roll: float = 0, v_pitch: float = 0, v_yaw: float = 0,
-    sub_req: int = 0x01,
-) -> bytes:
-    """构建上位机→GCU 主帧 (32 字节)"""
-    status = 0
-    if ctrl_valid: status |= 0x04
-    if imu_valid:  status |= 0x01
-
-    data = struct.pack('<hhh', roll_ctrl, pitch_ctrl, yaw_ctrl)
-    data += struct.pack('<B', status)
-    data += struct.pack('<hh', int(v_roll * 100), int(v_pitch * 100))
-    data += struct.pack('<H', int(v_yaw * 100) & 0xFFFF)
-    data += b'\x00' * 12   # 加速度 + 速度 (未接飞控时全0)
-    data += struct.pack('<B', sub_req)
-    data += b'\x00' * 6
-    return data
-
-
-def _build_sub_frame(lon=0.0, lat=0.0, alt=0.0, sat=0, rel_alt=0.0) -> bytes:
-    """构建上位机→GCU 副帧 (32 字节)"""
-    data = struct.pack('<B', 0x01)
-    data += struct.pack('<i', int(lon * 1e7))
-    data += struct.pack('<i', int(lat * 1e7))
-    data += struct.pack('<i', int(alt * 1000))
-    data += struct.pack('<B', sat)
-    data += struct.pack('<I', 0)   # GNSS time ms
-    data += struct.pack('<h', 0)   # GNSS week
-    data += struct.pack('<i', int(rel_alt * 1000))
-    data += b'\x00' * 8
-    return data
-
-
-def _build_packet(main: bytes, sub: bytes, cmd: int, params: bytes = b'') -> bytes:
-    """组装完整数据包"""
-    pkt_len = 72 + len(params)
-    data = HEADER_SEND
-    data += struct.pack('<H', pkt_len)
-    data += struct.pack('<B', PROTOCOL_VERSION)
-    data += main    # 5~36
-    data += sub     # 37~68
-    data += struct.pack('<B', cmd)
-    data += params
-    crc = _crc16(data)
-    data += struct.pack('>H', crc)   # CRC 大端序
-    return data
-
-
-def _parse_response(data: bytes) -> Optional[GCUStatus]:
-    """解析 GCU→上位机 数据包"""
-    if len(data) < 72:
-        return None
-    if data[0:2] != HEADER_RECV:
-        return None
-
-    pkt_len = struct.unpack('<H', data[2:4])[0]
-    if len(data) < pkt_len:
-        return None
-
-    # CRC 校验
-    crc_recv = struct.unpack('>H', data[pkt_len-2:pkt_len])[0]
-    crc_calc = _crc16(data[:pkt_len-2])
-    if crc_recv != crc_calc:
-        return None
-
-    s = GCUStatus()
-
-    # 主帧 (5~36)
-    s.mode = data[5]
-    s.status_flags = struct.unpack('<H', data[6:8])[0]
-    s.miss_h = struct.unpack('<h', data[8:10])[0]
-    s.miss_v = struct.unpack('<h', data[10:12])[0]
-    s.rel_roll  = struct.unpack('<h', data[12:14])[0] / 100.0
-    s.rel_pitch = struct.unpack('<h', data[14:16])[0] / 100.0
-    s.rel_yaw   = struct.unpack('<h', data[16:18])[0] / 100.0
-    s.abs_roll  = struct.unpack('<h', data[18:20])[0] / 100.0
-    s.abs_pitch = struct.unpack('<h', data[20:22])[0] / 100.0
-    s.abs_yaw   = struct.unpack('<H', data[22:24])[0] / 100.0
-    s.gyro_x    = struct.unpack('<h', data[24:26])[0] / 10.0
-    s.gyro_y    = struct.unpack('<h', data[26:28])[0] / 10.0
-    s.gyro_z    = struct.unpack('<h', data[28:30])[0] / 10.0
-
-    # 副帧 (37~68)
-    if data[37] == 0x01:
-        s.target_dist = struct.unpack('<i', data[43:47])[0] / 10.0
-        s.target_lon  = struct.unpack('<i', data[47:51])[0] / 1e7
-        s.target_lat  = struct.unpack('<i', data[51:55])[0] / 1e7
-        s.target_alt  = struct.unpack('<i', data[55:59])[0] / 1000.0
-        s.cam1_zoom   = struct.unpack('<H', data[59:61])[0] / 10.0
-        s.cam2_zoom   = struct.unpack('<H', data[61:63])[0] / 10.0
-        s.ir_status   = data[63]
-        s.cam_status  = struct.unpack('<H', data[64:66])[0]
-
-    # 命令反馈 (69+)
-    s.cmd_fb = data[69]
-    if pkt_len > 72:
-        s.cmd_result = data[70]
-
-    return s
-
-
-# ============================================================
-# GCU 通信管理器
-# ============================================================
+# ── GCU 连接 ──────────────────────────────────────────────────
 class GCUConnection:
-    """
-    GCU 底层通信连接
+    """GCU UDP 通信连接（兼容旧接口）"""
 
-    支持 UDP / TCP 两种方式。
-    发送数据包并接收回传，线程安全。
-    """
+    MODE_POINTING_LOCK   = 0x11
+    MODE_POINTING_FOLLOW = 0x12
+    MODE_TRACKING        = 0x17
+    FLAG_CONTROL_VALID   = 0x04
+    FLAG_IMU_VALID       = 0x01
 
-    def __init__(self, gcu_ip: str = DEFAULT_GCU_IP, mode: str = "udp"):
-        self.gcu_ip = gcu_ip
-        self.mode = mode
-        self.sock = None
-        self._lock = threading.Lock()
-        self._connected = False
+    def __init__(self, cfg: GimbalConfig):
+        self.host = cfg.gcu_ip
+        self.mode = cfg.comm_mode.lower()
+        self.sock: Optional[socket.socket] = None
+        self.running = False
+        self.recv_thread: Optional[threading.Thread] = None
+
+        self.latest_status: Optional[GimbalStatus] = None
+        self.status_lock   = threading.Lock()
+        self._recv_buffer  = bytearray()
+
+        # 控制量
+        self._roll    = 0
+        self._pitch   = 0
+        self._yaw     = 0
+        self._ctrl_ok = True
+
+        # 统计
+        self._total_recv      = 0
+        self._crc_errors      = 0
+        self._last_recv_time  = 0.0
+        self._last_err_report = 0.0
 
     def connect(self) -> bool:
         try:
-            if self.mode == "udp":
-                self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                self.sock.bind(('', UDP_DST_PORT))
-                self.sock.settimeout(0.5)
-                print(f"[GCU] UDP 就绪 (GCU={self.gcu_ip}, 监听端口={UDP_DST_PORT})")
-            elif self.mode == "tcp":
-                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.sock.settimeout(5.0)
-                self.sock.connect((self.gcu_ip, TCP_PORT))
-                self.sock.settimeout(0.5)
-                print(f"[GCU] TCP 已连接 {self.gcu_ip}:{TCP_PORT}")
-            self._connected = True
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock.bind(("0.0.0.0", GCU_RECV_PORT))
+            self.sock.settimeout(1.0)
+            self.running = True
+            self.recv_thread = threading.Thread(
+                target=self._recv_loop, daemon=True)
+            self.recv_thread.start()
+            print(f"[GCU] 连接成功 (UDP {self.host}:{GCU_SEND_PORT}, 本地:{GCU_RECV_PORT})")
             return True
         except Exception as e:
             print(f"[GCU] 连接失败: {e}")
             return False
 
     def disconnect(self):
-        self._connected = False
+        self.running = False
+        if self.recv_thread:
+            self.recv_thread.join(timeout=2.0)
         if self.sock:
             self.sock.close()
-            self.sock = None
+        print("[GCU] 连接已断开")
 
-    def send_and_recv(self, packet: bytes) -> Optional[GCUStatus]:
-        """发送数据包并接收解析回传"""
-        if not self._connected or not self.sock:
-            return None
-        with self._lock:
+    def shutdown(self):
+        self.running = False
+        if self.sock:
             try:
-                if self.mode == "udp":
-                    self.sock.sendto(packet, (self.gcu_ip, UDP_SRC_PORT))
-                    data, _ = self.sock.recvfrom(1024)
-                else:
-                    self.sock.sendall(packet)
-                    data = self.sock.recv(1024)
-                return _parse_response(data)
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            self.sock.close()
+
+    # ── 发送 ──────────────────────────────────────────────────
+    def send(self, cmd_id: int = 0x00, payload: bytes = b"") -> bool:
+        """兼容旧 GCUCommander 接口，cmd_id 映射到 GCU 指令字节"""
+        CMD_MAP = {
+            0x0001: 0x00,   # HEARTBEAT       → 空命令
+            0x0002: 0x00,   # GIMBAL_CONTROL  → 控制量在 _pitch/_yaw
+            0x0003: 0x00,   # START_TRACKING
+            0x0004: 0x00,   # STOP_TRACKING
+            0x0005: 0x11,   # POINTING_LOCK
+            0x0006: 0x03,   # RESET_GIMBAL
+            0x0007: 0x25,   # ZOOM_CONTROL    → CMD_ZOOM_SET
+        }
+        gcu_cmd = CMD_MAP.get(cmd_id, cmd_id & 0xFF)
+        return self._send_packet(gcu_cmd)
+
+    def _send_packet(self, command: int = 0x00) -> bool:
+        if not self.sock:
+            return False
+        try:
+            pkt = self._build_packet(command)
+            self.sock.sendto(pkt, (self.host, GCU_SEND_PORT))
+            return True
+        except Exception as e:
+            print(f"[GCU] 发送失败: {e}")
+            return False
+
+    def _build_packet(self, command: int = 0x00) -> bytes:
+        pkt = bytearray()
+        pkt.extend(PROTOCOL_HEADER_SEND)            # 2字节 帧头
+        pkt.extend(struct.pack("<H", 72))            # 2字节 包长度
+        pkt.append(PROTOCOL_VERSION)                 # 1字节 版本号
+        pkt.extend(struct.pack("<h", self._roll))    # 2字节 滚转控制量
+        pkt.extend(struct.pack("<h", self._pitch))   # 2字节 俯仰控制量
+        pkt.extend(struct.pack("<h", self._yaw))     # 2字节 偏航控制量
+        flag = 0
+        if self._ctrl_ok:
+            flag |= self.FLAG_CONTROL_VALID
+        flag |= self.FLAG_IMU_VALID
+        pkt.append(flag)                             # 1字节 状态标志
+        pkt.extend(bytes(18))                        # 22字节 载机数据（全0）
+        pkt.append(0x01)                             # 1字节 请求副帧
+        pkt.extend(bytes(6))                         # 6字节 预留
+        pkt.append(0x01)                             # 1字节 副帧帧头
+        pkt.extend(bytes(31))                        # 31字节 GNSS数据（全0）
+        pkt.append(command)                          # 1字节 指令
+        crc = _crc16(bytes(pkt))
+        pkt.extend(struct.pack(">H", crc))           # 2字节 CRC（大端）
+        return bytes(pkt)
+
+    def set_control(self, pitch: int = 0, yaw: int = 0, valid: bool = True):
+        """设置控制量（单位: 0.1°/s）"""
+        self._pitch   = pitch
+        self._yaw     = yaw
+        self._ctrl_ok = valid
+
+    # ── 接收 ──────────────────────────────────────────────────
+    def _recv_loop(self):
+        while self.running:
+            try:
+                data, _ = self.sock.recvfrom(2048)
+                self._recv_buffer.extend(data)
+                self._parse_buffer()
             except socket.timeout:
-                return None
+                continue
             except Exception as e:
-                print(f"[GCU] 通信错误: {e}")
-                return None
+                if self.running:
+                    print(f"[GCU] 接收错误: {e}")
+                break
 
-    @property
-    def connected(self) -> bool:
-        return self._connected
+    def _parse_buffer(self):
+        while len(self._recv_buffer) >= 72:
+            idx = self._recv_buffer.find(PROTOCOL_HEADER_RECV)
+            if idx == -1:
+                self._recv_buffer.clear()
+                return
+            if idx > 0:
+                self._recv_buffer = self._recv_buffer[idx:]
+            if len(self._recv_buffer) < 4:
+                return
+            pkt_len = struct.unpack("<H", self._recv_buffer[2:4])[0]
+            if len(self._recv_buffer) < pkt_len:
+                return
+            pkt = bytes(self._recv_buffer[:pkt_len])
+            self._recv_buffer = self._recv_buffer[pkt_len:]
+            self._parse_packet(pkt)
 
+    def _parse_packet(self, pkt: bytes):
+        if len(pkt) < 72:
+            return
+        self._total_recv += 1
+        self._last_recv_time = time.time()
 
-# ============================================================
-# 高级命令接口 (供 GimbalHardwareZ2Mini 调用)
-# ============================================================
+        crc_recv = struct.unpack(">H", pkt[-2:])[0]
+        crc_calc = _crc16(pkt[:-2])
+        if crc_recv != crc_calc:
+            self._crc_errors += 1
+            now = time.time()
+            if now - self._last_err_report > 5.0:
+                rate = self._crc_errors / max(self._total_recv, 1)
+                print(f"[GCU] ⚠ CRC错误 累计{self._crc_errors}/{self._total_recv} ({rate:.1%})")
+                self._last_err_report = now
+            return
+
+        try:
+            work_mode = pkt[5]
+            pitch     = struct.unpack("<h", pkt[20:22])[0] / 100.0
+            yaw       = struct.unpack("<H", pkt[22:24])[0] / 100.0
+            roll      = struct.unpack("<h", pkt[18:20])[0] / 100.0
+            cam1_zoom = 1.0
+            cam2_zoom = 1.0
+            if len(pkt) >= 63:
+                cam1_zoom = struct.unpack("<H", pkt[59:61])[0] / 10.0
+                cam2_zoom = struct.unpack("<H", pkt[61:63])[0] / 10.0
+            off_h = struct.unpack("<h", pkt[8:10])[0] / 10.0
+            off_v = struct.unpack("<h", pkt[10:12])[0] / 10.0
+
+            status = GimbalStatus(
+                mode=work_mode,
+                pitch=pitch,
+                yaw=yaw,
+                roll=roll,
+                cam1_zoom=cam1_zoom,
+                cam2_zoom=cam2_zoom,
+                is_tracking_ok=(work_mode == 0x17),
+                target_x=int(off_h),
+                target_y=int(off_v)
+            )
+            with self.status_lock:
+                self.latest_status = status
+        except Exception:
+            pass
+
+    # ── 状态查询 ──────────────────────────────────────────────
+    def get_status(self) -> Optional[GimbalStatus]:
+        with self.status_lock:
+            return self.latest_status
+
+    def is_healthy(self, timeout: float = 2.0) -> bool:
+        if not self._last_recv_time:
+            return False
+        return (time.time() - self._last_recv_time) < timeout
+
+    def get_stats(self) -> dict:
+        return {
+            "total_recv":    self._total_recv,
+            "crc_errors":    self._crc_errors,
+            "error_rate":    self._crc_errors / max(self._total_recv, 1),
+            "last_recv_ago": time.time() - self._last_recv_time if self._last_recv_time else float("inf"),
+            "is_healthy":    self.is_healthy()
+        }
+
+# ── GCU 命令接口（兼容旧 GCUCommander 接口）─────────────────
 class GCUCommander:
-    """
-    GCU 指令发送器
+    """保持与 gimbal_controller.py 的接口兼容"""
 
-    封装常用命令的参数构建, 返回 GCUStatus。
-    """
+    def __init__(self, connection: GCUConnection):
+        self.conn = connection
 
-    def __init__(self, conn: GCUConnection):
-        self.conn = conn
+    def heartbeat(self) -> Optional[GimbalStatus]:
+        self.conn._send_packet(0x00)
+        time.sleep(0.05)
+        return self.conn.get_status()
 
-    def _send(self, cmd: int, params: bytes = b'',
-              pitch_ctrl: int = 0, yaw_ctrl: int = 0, roll_ctrl: int = 0,
-              ctrl_valid: bool = False) -> Optional[GCUStatus]:
-        main = _build_main_frame(
-            roll_ctrl=roll_ctrl, pitch_ctrl=pitch_ctrl, yaw_ctrl=yaw_ctrl,
-            ctrl_valid=ctrl_valid, sub_req=0x01,
-        )
-        sub = _build_sub_frame()
-        pkt = _build_packet(main, sub, cmd, params)
-        return self.conn.send_and_recv(pkt)
+    def gimbal_control(self, pitch_speed: int, yaw_speed: int) -> bool:
+        self.conn.set_control(pitch=pitch_speed, yaw=yaw_speed, valid=True)
+        return self.conn._send_packet(0x00)
 
-    def heartbeat(self) -> Optional[GCUStatus]:
-        """空命令心跳"""
-        return self._send(CMD_EMPTY)
+    def start_tracking(self, x0: int, y0: int, x1: int, y1: int) -> Optional[bool]:
+        if x0 < 0 or y0 < 0 or x1 <= x0 or y1 <= y0:
+            print(f"[GCU] ⚠ 坐标非法: ({x0},{y0})-({x1},{y1})")
+            return None
+        return self.conn._send_packet(0x17)
 
-    def home(self) -> Optional[GCUStatus]:
-        """回中"""
-        return self._send(CMD_HOME)
+    def stop_tracking(self) -> bool:
+        self.conn.set_control(0, 0, False)
+        return self.conn._send_packet(0x11)
 
-    # ---- 跟踪 (0x17) ----
+    def pointing_lock(self, pitch_speed: int, yaw_speed: int,
+                      auto_zoom_compensate: bool = True) -> bool:
+        if auto_zoom_compensate:
+            st = self.conn.get_status()
+            if st and st.cam1_zoom > 1.0:
+                pitch_speed = int(pitch_speed * st.cam1_zoom)
+                yaw_speed   = int(yaw_speed   * st.cam1_zoom)
+        self.conn.set_control(pitch=pitch_speed, yaw=yaw_speed, valid=True)
+        return self.conn._send_packet(0x00)
 
-    def start_tracking(self, x0: int, y0: int, x1: int, y1: int) -> Optional[GCUStatus]:
-        """
-        启动吊舱内置跟踪
+    def reset_gimbal(self) -> bool:
+        self.conn.set_control(0, 0, False)
+        return self.conn._send_packet(0x03)
 
-        坐标系: 图像左上角原点, [0, 10000]
-        """
-        params = struct.pack('<B', 0x01)          # TT=0x01 进入跟踪
-        params += struct.pack('<HHHH', x0, y0, x1, y1)
-        return self._send(CMD_TRACK, params)
-
-    def stop_tracking(self) -> Optional[GCUStatus]:
-        """停止跟踪"""
-        params = struct.pack('<B', 0x00)
-        params += struct.pack('<HHHH', 0, 0, 0, 0)
-        return self._send(CMD_TRACK, params)
-
-    # ---- 指向锁定 + 角速度控制 (0x11) ----
-
-    def pointing_lock(self, pitch_speed: int = 0, yaw_speed: int = 0,
-                      ctrl_valid: bool = True) -> Optional[GCUStatus]:
-        """
-        指向锁定模式 - 发送角速度控制
-
-        speed 单位: 0.1°/s (除以当前变焦倍率)
-        """
-        return self._send(CMD_POINTING_LOCK,
-                          pitch_ctrl=pitch_speed, yaw_ctrl=yaw_speed,
-                          ctrl_valid=ctrl_valid)
-
-    # ---- 指点平移 (0x1A) ----
-
-    def point_move(self, x: int, y: int) -> Optional[GCUStatus]:
-        """指点平移, 坐标 [0, 10000]"""
-        params = struct.pack('<B', 0x01)
-        params += struct.pack('<HH', x, y)
-        return self._send(CMD_POINT_MOVE, params)
-
-    # ---- 相机功能 ----
-
-    def take_photo(self) -> Optional[GCUStatus]:
-        return self._send(CMD_PHOTO, bytes([0x01]))
-
-    def toggle_record(self) -> Optional[GCUStatus]:
-        return self._send(CMD_RECORD, bytes([0x01]))
-
-    def zoom_set(self, cam_id: int = 0x01, value: int = 1) -> Optional[GCUStatus]:
-        params = struct.pack('<Bh', cam_id, value)
-        return self._send(CMD_ZOOM_SET, params)
-
-    def zoom_in(self, cam_id: int = 0x01) -> Optional[GCUStatus]:
-        return self._send(CMD_ZOOM_IN, bytes([cam_id]))
-
-    def zoom_out(self, cam_id: int = 0x01) -> Optional[GCUStatus]:
-        return self._send(CMD_ZOOM_OUT, bytes([cam_id]))
-
-    def zoom_stop(self, cam_id: int = 0x01) -> Optional[GCUStatus]:
-        return self._send(CMD_ZOOM_STOP, bytes([cam_id]))
-
-    def set_pip(self, mode: int = 0) -> Optional[GCUStatus]:
-        return self._send(CMD_PIP, bytes([mode]))
+    def zoom_control(self, camera_id: int, zoom_speed: int) -> bool:
+        return self.conn._send_packet(0x25)
