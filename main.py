@@ -15,14 +15,13 @@
 """
 
 import sys, os, time, argparse, threading
-import numpy as np
 import cv2
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import (SystemConfig, get_default_config,
-                    get_simulation_config, get_z2mini_config)
-from modules.detector import TargetDetector
+from config import (get_default_config,
+                    get_z2mini_config)
+from modules.detector import YOLODetector as TargetDetector
 from modules.tracker import MultiObjectTracker
 from modules.gimbal_controller import GimbalController
 from modules.visualizer import Visualizer, DataRecorder, generate_analysis_plots
@@ -51,26 +50,45 @@ class RTSPCapture:
         self._frame_count = 0
 
     def open(self) -> bool:
-        # FFmpeg 后端 + TCP 传输减少丢包
-        os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp'
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "fflags;nobuffer|flags;low_delay"
         self._cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
         self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         if not self._cap.isOpened():
             print(f"[RTSP] ✗ 无法打开: {self.url}")
-            print(f"[RTSP]   1. 确认上位机 IP 与 GCU 同子网")
-            print(f"[RTSP]   2. 测试: ffplay {self.url}")
             return False
 
-        self.width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        print("[RTSP] 等待视频流稳定...")
+        import time as _time
+        deadline = _time.time() + 8.0
+        got = False
+        while _time.time() < deadline:
+            ret, frame = self._cap.read()
+            if ret and frame is not None:
+                h, w = frame.shape[:2]
+                if w > 0 and h > 0:
+                    self.width  = w
+                    self.height = h
+                    with self._lock:
+                        self._frame = frame
+                    got = True
+                    break
+            _time.sleep(0.1)
+
+        if not got:
+            print(f"[RTSP] ✗ 8秒内未收到有效帧: {self.url}")
+            return False
+
         fps = self._cap.get(cv2.CAP_PROP_FPS)
-        print(f"[RTSP] ✓ 已连接: {self.width}x{self.height} @ {fps:.1f}fps")
+        if fps <= 0 or fps > 1000:
+            fps = 30.0
+        print(f"[RTSP] 已连接: {self.width}x{self.height} @ {fps:.1f}fps")
 
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         return True
+
 
     def _loop(self):
         while self._running:
@@ -135,7 +153,7 @@ class GimbalTrackingSystem:
         # 3. 云台控制
         print("[3/4] 初始化云台控制...")
         fsz = (c.camera.frame_width, c.camera.frame_height)
-        self.gimbal_ctrl = GimbalController(c.gimbal, fsz)
+        self.gimbal_ctrl = GimbalController(c.gimbal, c.camera)
 
         # 4. 可视化
         print("[4/4] 初始化可视化...")
@@ -151,7 +169,7 @@ class GimbalTrackingSystem:
         self.mouse_click_pos = None
         self.video_writer = None
 
-        if not self.detector.use_yolo:
+        if self.detector.model is None:
             print("\n" + "!" * 60)
             print("  警告: YOLOv13 模型未加载成功!")
             print("!" * 60 + "\n")
@@ -198,7 +216,7 @@ class GimbalTrackingSystem:
         # 更新实际分辨率
         self.config.camera.frame_width = w
         self.config.camera.frame_height = h
-        self.gimbal_ctrl = GimbalController(self.config.gimbal, (w, h))
+        self.gimbal_ctrl = GimbalController(self.config.gimbal, self.config.camera)
         self.visualizer = Visualizer((w, h))
 
         if self.config.record_video:
@@ -233,10 +251,10 @@ class GimbalTrackingSystem:
         t0 = time.time()
 
         # Step 1: YOLOv13 检测
-        detections = self.detector.detect(frame, enhance=True)
+        detections = self.detector.detect(frame)
 
         # Step 2: 卡尔曼+CNN 多目标跟踪
-        active_trackers = self.tracker.update(detections, frame)
+        active_trackers = self.tracker.update(detections)
 
         # Step 3: 主目标选择
         self._handle_mouse()
@@ -249,26 +267,45 @@ class GimbalTrackingSystem:
         # Step 4: 云台控制
         tpos = primary.current_center if primary else None
         tvel = primary.current_velocity if primary else None
-        # ★ 新增: 传递目标 bbox 给 gimbal_builtin 模式使用
         tbbox = None
         if primary:
             b = primary.current_bbox
             tbbox = (int(b[0]), int(b[1]), int(b[2]), int(b[3]))
 
-        ctrl = self.gimbal_ctrl.compute_control(
-            tpos, tvel, time.time(), target_bbox=tbbox
+        ctrl_dict = self.gimbal_ctrl.compute_control(
+            tpos, time.time()
         )
-        gstate = self.gimbal_ctrl.get_gimbal_state()
 
-        # Step 5: 可视化
+        if not self.config.gimbal.simulate_mode and self.gimbal_ctrl.commander:
+            if self.config.gimbal.track_mode == "software_pid":
+                self.gimbal_ctrl._software_pid(ctrl_dict)
+
+        # 获取云台状态 (兼容你上一步的修复)
+        gstate = self.gimbal_ctrl.get_gimbal_state() if hasattr(self.gimbal_ctrl, 'get_gimbal_state') else (
+            self.gimbal_ctrl.gimbal.get_status() if hasattr(self.gimbal_ctrl,
+                                                            'gimbal') and self.gimbal_ctrl.gimbal else None)
+
+        # ====== 新增：数据转换器 (字典转对象) ======
+        class CtrlObject:
+            def __init__(self, d):
+                self.yaw_cmd = d.get('yaw_speed', 0)
+                self.pitch_cmd = d.get('pitch_speed', 0)
+                self.yaw_error = d.get('error_x', 0)
+                self.pitch_error = d.get('error_y', 0)
+                self.is_locked = d.get('has_target', False)
+
+        ctrl_obj = CtrlObject(ctrl_dict) if ctrl_dict else None
+        # ============================================
+
+        # Step 5: 可视化 (传入转换后的 ctrl_obj)
         display = self.visualizer.draw_frame(
-            frame, active_trackers, primary, ctrl, gstate, detections,
-            self.show_trajectory, self.show_info, self.detector.use_yolo)
+            frame, active_trackers, primary, ctrl_obj, gstate, detections,
+            self.show_trajectory, self.show_info, self.detector.model is not None)
 
-        # Step 6: 记录
+        # Step 6: 记录 (传入转换后的 ctrl_obj)
         if self.config.save_tracking_data:
             self.recorder.record_frame(self.frame_count, detections, primary,
-                                       ctrl, gstate, time.time() - t0)
+                                       ctrl_obj, gstate, time.time() - t0)
 
         if self.video_writer:
             self.video_writer.write(display)
@@ -376,9 +413,9 @@ class GimbalTrackingSystem:
         print(f"\n{'='*50}")
         print(f"  Frames: {self.frame_count}")
         s = self.detector.get_stats()
-        print(f"  Detect FPS: {s['detector_fps']}  |  YOLO: {s['use_yolo']}")
+        print(f"  Detect FPS: {s['inference_fps']}  |  YOLO: {s['model_loaded']}")
         cs = self.gimbal_ctrl.get_stats()
-        print(f"  Locked: {cs['is_locked']}  |  Yaw Err: {cs['pid_yaw_stats'].get('mean_error',0):.1f}px")
+        print(f"  Locked: {cs['is_locked']}  |  Quality: {cs['tracking_quality']:.2f}  |  Pitch: {cs['gimbal_pitch']:.1f}  Yaw: {cs['gimbal_yaw']:.1f}")
         if cs.get('is_hardware'):
             print(f"  Mode: {cs.get('gcu_mode','N/A')}  |  Zoom: {cs.get('gcu_zoom','N/A')}x")
         print(f"{'='*50}\n")
