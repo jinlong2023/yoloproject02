@@ -18,10 +18,10 @@ class DetectorConfig:
     model_name: str = "runs/detect/train/weights/best.pt"
     confidence_threshold: float = 0.35
     nms_threshold: float = 0.5
-    input_size: Tuple[int, int] = (640, 640)
+    input_size: Tuple[int, int] = (480, 480)
     target_classes: List[int] = field(default_factory=lambda: [])
     device: str = "cuda:0"
-    half_precision: bool = False
+    half_precision: bool = True
     max_det: int = 50
     augment: bool = False
 
@@ -29,14 +29,14 @@ class DetectorConfig:
 @dataclass
 class TrackerConfig:
     """目标跟踪模块配置"""
-    process_noise_std: float = 1.0
+    process_noise_std: float = 5.0
     measurement_noise_std: float = 0.5
-    dt: float = 1.0 / 30.0
-    max_age: int = 30
+    dt: float = 1.0          # 单位: 帧 (速度=像素/帧)
+    max_age: int = 15
     min_hits: int = 3
-    iou_threshold: float = 0.3
+    iou_threshold: float = 0.05
     feature_dim: int = 128
-    feature_weight: float = 0.6
+    feature_weight: float = 0.0
     reid_threshold: float = 0.4
     optical_flow_winsize: int = 15
     optical_flow_maxlevel: int = 3
@@ -74,7 +74,7 @@ class GimbalConfig:
     # ===== Z-2Mini 硬件参数 (simulate_mode=False 时生效) =====
     gcu_ip: str = "192.168.144.108"  # GCU IP 地址
     comm_mode: str = "udp"           # "udp" 或 "tcp"
-    track_mode: str = "gimbal_builtin"
+    track_mode: str = "software_pid"
     # track_mode 选项:
     #   "software_pid"   - 上位机 PID 持续控制角速度 (原有逻辑)
     #   "gimbal_builtin" - YOLO 检测框 → 0x17, 吊舱内置跟踪 (推荐)
@@ -148,7 +148,7 @@ def get_z2mini_config() -> SystemConfig:
     config = SystemConfig()
 
     # 视频源: Z-2Mini RTSP 流
-    config.camera.source = "rtsp://192.168.144.108"
+    config.camera.source = "rtsp://192.168.144.108"  # :554/"
     config.camera.frame_width = 1920
     config.camera.frame_height = 1080
     config.camera.fps = 30
