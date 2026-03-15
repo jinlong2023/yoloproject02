@@ -118,7 +118,7 @@ class GimbalController:
 
     # ── 核心控制 ──────────────────────────────────────────────
     def compute_control(self,
-                        target_position: Optional[Tuple[float, float]],
+                        target: Optional['KalmanTracker'],
                         timestamp: float = None) -> Dict:
         if timestamp is None:
             timestamp = time.time()
@@ -135,6 +135,17 @@ class GimbalController:
                     print("[Gimbal] ⚠ 连接不健康，发送心跳恢复")
                     self.commander.heartbeat()
                 self._last_health_check = timestamp
+
+        if target is None:
+            self.pid_yaw.reset()
+            self.pid_pitch.reset()
+            self.smooth_yaw = 0.0
+            self.smooth_pitch = 0.0
+            return {'yaw_speed': 0, 'pitch_speed': 0, 'has_target': False}
+
+        target_position = target.current_center
+        target_velocity = target.current_velocity
+
 
         # 无目标
         if target_position is None:
@@ -156,8 +167,16 @@ class GimbalController:
         dz = self.cfg.dead_zone / 100.0
         if abs(error_x_norm) < dz:
             error_x_norm = 0.0
+            self.pid_yaw.integral = 0.0  # 🌟 修复：进入死区后立刻清空累积的偏航漂移
         if abs(error_y_norm) < dz:
             error_y_norm = 0.0
+            self.pid_pitch.integral = 0.0  # 🌟 修复：进入死区后立刻清空累积的俯仰下垂
+
+        yaw_pid_out = self.pid_yaw.compute(error_x_norm, dt)
+        pitch_pid_out = self.pid_pitch.compute(-error_y_norm, dt)
+
+        vx_norm = target_velocity[0] / (self.frame_w / 2.0)
+        vy_norm = target_velocity[1] / (self.frame_h / 2.0)
 
         # PID
         yaw_out   = self.pid_yaw.compute(error_x_norm,  dt)
@@ -176,7 +195,6 @@ class GimbalController:
             'error_x': error_x,
             'error_y': error_y
         }
-
     def update(self,
                target_position: Optional[Tuple[float, float]],
                target_bbox: Optional[np.ndarray] = None,
